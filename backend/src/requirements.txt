@@ -1,0 +1,2 @@
+# boto3 / botocore are provided by the Lambda Python runtime.
+# No third-party dependencies required.

@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AI Task Prioritizer - serverless backend (Bedrock Nova + Lambda + DynamoDB).
+  Weekend Productivity Challenge submission.
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: Amazon Bedrock model id used for prioritization.
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: Allowed CORS origin for the HTTP API (use your Amplify domain in production).
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+    Architectures:
+      - arm64
+
+Resources:
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+
+  PrioritizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      CodeUri: src/
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TasksTable
+          MODEL_ID: !Ref ModelId
+          CORS_ORIGIN: !Ref CorsOrigin
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+      Events:
+        Prioritize:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /prioritize
+            Method: POST
+        History:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /history
+            Method: GET
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOrigin
+        AllowHeaders:
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the HTTP API. Paste this into frontend/app.js.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  TableName:
+    Description: DynamoDB table storing prioritization history.
+    Value: !Ref TasksTable

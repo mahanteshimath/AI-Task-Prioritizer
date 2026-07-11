@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# AWS SAM build artifacts
+backend/.aws-sam/
+samconfig.toml
+backend/packaged.yaml
+
+# Deployment artifacts
+frontend-deploy.zip
+
+# Local runtime data
+backend/.local_history.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env / secrets
+.env
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
