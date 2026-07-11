@@ -19,6 +19,8 @@ Built for the **AWS Weekend Productivity Challenge**.
 
 **🔗 Live demo:** https://main.d2ncn9d88sa351.amplifyapp.com
 
+**💻 Repository:** https://github.com/mahanteshimath/AI-Task-Prioritizer
+
 </div>
 
 ---
@@ -55,8 +57,10 @@ Built for the **AWS Weekend Productivity Challenge**.
 | 🏷️ **Auto categories** | Tasks are tagged `work`, `personal`, `health`, `finance`, `learning`, or `admin`. |
 | ⚡ **Quick wins** | Highlights tasks ≤15 min with medium+ impact so you can build momentum fast. |
 | 📊 **Summary dashboard** | At-a-glance totals: task count, total estimated time, quick wins, urgent items. |
-| 🎙️ **Voice input** | Speak tasks with the Web Speech API (live mic) or upload a voice note. |
+| 🎙️ **Voice input** | Speak tasks with the Web Speech API (live mic), or **upload a voice note** transcribed by **Amazon Transcribe**. |
+| ✅ **Review & confirm** | After voice/recording, a review step shows the detected tasks so you can **edit misheard words, remove duplicates, or add missing items** before ranking. |
 | 🕘 **Run history** | Every prioritization is saved. Click any past run tile to re-open its full breakdown. |
+| 🗑️ **Delete & clear** | Remove any single past run, or clear the entire history — both with a confirmation. |
 | 🎨 **Polished dark UI** | Responsive, accessible, zero-framework HTML/CSS/JS — loads instantly. |
 
 ---
@@ -68,7 +72,8 @@ Built for the **AWS Weekend Productivity Challenge**.
 │  Browser  ·  AWS Amplify Hosting (static HTML / CSS / JS)      │
 │  main.d2ncn9d88sa351.amplifyapp.com                            │
 └───────────────┬──────────────────────────────────────────────┘
-                │  POST /prioritize   GET /history   (HTTPS + CORS)
+                │  POST /prioritize · GET /history                (HTTPS + CORS)
+                │  POST /transcribe · GET /transcribe-status
                 ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  Amazon API Gateway  ·  HTTP API                              │
@@ -77,8 +82,10 @@ Built for the **AWS Weekend Productivity Challenge**.
                 ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  AWS Lambda  ·  Python 3.12  ·  arm64                         │
-│    ├── Amazon Bedrock  → Nova Lite   (ranking + reasoning)     │
-│    └── Amazon DynamoDB → save + list run history              │
+│    ├── Amazon Bedrock     → Nova Lite   (ranking + reasoning)  │
+│    ├── Amazon DynamoDB    → save + list run history           │
+│    ├── Amazon S3          → store voice notes + transcripts    │
+│    └── Amazon Transcribe  → voice-note speech-to-text          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,10 +102,11 @@ All infrastructure is declared as code in [`backend/template.yaml`](backend/temp
 | **Compute** | AWS Lambda (Python 3.12, arm64) |
 | **API** | Amazon API Gateway (HTTP API) with CORS |
 | **Data** | Amazon DynamoDB (on-demand billing) |
+| **Voice-note transcription** | Amazon Transcribe + Amazon S3 (auto-expiring uploads) |
 | **Hosting** | AWS Amplify Hosting (manual/CLI deploy) |
 | **IaC** | AWS SAM + CloudFormation |
 | **Frontend** | Vanilla HTML5, CSS3, JavaScript (no build step) |
-| **Voice** | Web Speech API (`SpeechRecognition`) + `AudioContext` |
+| **Voice** | Web Speech API (live mic) + Amazon Transcribe (uploaded files) |
 | **Local dev** | Pure-Python dev server (`backend/local_server.py`) — no SAM required |
 
 ---
@@ -319,6 +327,51 @@ Return the most recent prioritization runs (each includes the full ranked result
 }
 ```
 
+### `DELETE /history`
+
+Delete a single run or clear the whole history.
+
+```
+DELETE /history?createdAt=<isoTimestamp>   # delete one run
+DELETE /history?all=true                   # clear all runs
+```
+
+**Response**
+
+```json
+{ "deleted": 1 }
+```
+
+### `POST /transcribe`
+
+Upload a voice note (base64) and start an Amazon Transcribe job.
+
+**Request**
+
+```json
+{ "audio": "<base64-encoded audio>", "format": "mp3" }
+```
+
+Supported formats: `mp3`, `mp4`, `m4a`, `wav`, `flac`, `ogg`, `amr`, `webm` (max 5 MB).
+
+**Response** — `202 Accepted`
+
+```json
+{ "jobName": "tp-a1b2c3…" }
+```
+
+### `GET /transcribe-status?job=<jobName>`
+
+Poll for the transcription result.
+
+```json
+{ "status": "IN_PROGRESS" }
+```
+
+```json
+{ "status": "COMPLETED", "text": "Finish the quarterly report. Call the dentist." }
+```
+
 ---
 
 ## 🧠 How the AI ranking works
@@ -332,6 +385,12 @@ Return the most recent prioritization runs (each includes the full ranked result
    the ranked list.
 5. The UI renders the summary dashboard, quick-wins callout, and the color-coded table.
 
+**Voice notes:** when you upload an audio file, the frontend sends it to `POST /transcribe`,
+which stores it in **Amazon S3** and starts an **Amazon Transcribe** job. The UI polls
+`GET /transcribe-status` until the transcript is ready, then splits it into task lines. Before
+ranking, a **review step** lets you edit misheard words, remove duplicates, and confirm the
+tasks — so imperfect transcription never produces a wrong result.
+
 ---
 
 ## ⚙️ Configuration
@@ -341,16 +400,22 @@ Return the most recent prioritization runs (each includes the full ranked result
 | `API_BASE_URL` | `frontend/app.js` | falls back to same-origin for local dev |
 | `ModelId` | `backend/template.yaml` param | `amazon.nova-lite-v1:0` |
 | `CorsOrigin` | `backend/template.yaml` param | `*` (tighten in production) |
+| `AUDIO_BUCKET` | set automatically by the stack (Lambda env) | created S3 bucket |
 | `AWS_REGION` / `MODEL_ID` | `backend/.env` (local only) | `us-east-1` / Nova Lite |
 | `MAX_TASKS` | `app.py` / `local_server.py` | `25` |
+
+> For **local** voice-note upload, set `AUDIO_BUCKET=<your-bucket>` in `backend/.env`.
 
 ---
 
 ## 🔒 Security notes
 
 - **Never commit `.env`** — it is git-ignored. Rotate any key that is exposed.
-- The Lambda IAM policy grants only `bedrock:InvokeModel` on the chosen model plus scoped
-  DynamoDB CRUD — least privilege by design.
+- The Lambda IAM policy grants only `bedrock:InvokeModel` on the chosen model, scoped
+  DynamoDB CRUD, scoped S3 access to the audio bucket, and Transcribe job actions — least
+  privilege by design.
+- Uploaded audio and transcripts **auto-expire from S3 after 1 day** (lifecycle rule).
+- The audio bucket blocks all public access; only the Lambda role can read/write it.
 - All user-supplied text is HTML-escaped in the UI to prevent XSS.
 - The local dev server includes path-traversal protection for static files.
 - Set `CorsOrigin` to your Amplify domain in production instead of `*`.
@@ -359,14 +424,18 @@ Return the most recent prioritization runs (each includes the full ranked result
 
 ## 💰 Cost
 
-Fully **serverless and on-demand** — Nova Lite, Lambda, API Gateway, and DynamoDB sit
-comfortably in the **AWS Free Tier** for personal use. You pay only for what you invoke.
+Fully **serverless and on-demand** — Nova Lite, Lambda, API Gateway, DynamoDB, S3, and
+Transcribe sit comfortably in the **AWS Free Tier** for personal use. You pay only for what
+you invoke.
 
 ---
 
 ## 🧹 Cleanup
 
 ```powershell
+# Empty the audio bucket (auto-created by the stack) so the stack can delete it
+aws s3 rm s3://<audio-bucket-name> --recursive
+
 # Delete the backend stack
 aws cloudformation delete-stack --stack-name ai-task-prioritizer --region us-east-1
 
@@ -377,11 +446,13 @@ aws amplify delete-app --app-id <APP_ID> --region us-east-1
 aws s3 rb s3://ai-task-prioritizer-deploy-<ACCOUNT_ID> --force
 ```
 
+> The audio bucket name is in the stack outputs (`AudioBucketName`).
+
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Server-side transcription with **Amazon Transcribe** (Safari + offline audio support)
+- [ ] Multi-language voice transcription (Transcribe language identification)
 - [ ] User accounts + per-user history (Amazon Cognito)
 - [ ] Calendar export (`.ics`) from suggested due dates
 - [ ] Drag-and-drop manual reordering with AI re-scoring

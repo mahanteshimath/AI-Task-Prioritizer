@@ -1,12 +1,14 @@
 # Weekend Productivity Challenge: AI Task Prioritizer – Intelligent To‑Do Ranking with Amazon Bedrock and AWS Serverless
 
-Learn how I built **AI Task Prioritizer**, an AI-powered productivity assistant using **Amazon Bedrock (Nova Lite)**, **AWS Lambda**, **Amazon API Gateway**, **Amazon DynamoDB**, **AWS Amplify Hosting**, and **AWS SAM / CloudFormation**. This article walks through the vision, architecture, implementation, deployment, and lessons learned while shipping a fully serverless AWS application for the Weekend Productivity Challenge.
+Learn how I built **AI Task Prioritizer**, an AI-powered productivity assistant using **Amazon Bedrock (Nova Lite)**, **AWS Lambda**, **Amazon API Gateway**, **Amazon DynamoDB**, **Amazon Transcribe**, **Amazon S3**, **AWS Amplify Hosting**, and **AWS SAM / CloudFormation**. This article walks through the vision, architecture, implementation, deployment, and lessons learned while shipping a fully serverless AWS application for the Weekend Productivity Challenge.
 
 **Author:** Mahantesh Hiremath · mahanteshimath@gmail.com
 
 **Tag:** #productivity
 
 **🔗 Live application:** https://main.d2ncn9d88sa351.amplifyapp.com
+
+**💻 GitHub repository:** https://github.com/mahanteshimath/AI-Task-Prioritizer
 
 ---
 
@@ -68,8 +70,10 @@ decisions about **how to spend your time**.
 - 📅 **Smart, date-aware due dates** relative to today
 - 🏷️ **Automatic categorization** into six life/work areas
 - ⚡ **Quick-win detection** to build momentum fast
-- 🎙️ **Voice input** — live speech-to-text or voice-note upload
+- 🎙️ **Voice input** — live speech-to-text (Web Speech API) or **voice-note upload transcribed by Amazon Transcribe**
+- ✅ **Review & confirm step** — edit misheard words, remove duplicates, and confirm before prioritizing
 - 🕘 **Historical tracking** with clickable, re-openable past runs
+- 🗑️ **Delete or clear history** — remove a single run or wipe them all
 - 📊 **Summary dashboard** for at-a-glance planning
 - ☁️ **Fully serverless AWS architecture**
 - 🧱 **Infrastructure as Code** with AWS SAM / CloudFormation
@@ -108,6 +112,28 @@ partition/sort key design (`pk = "history"`, sorted by `createdAt`) lets me fetc
 runs with `ScanIndexForward=False`. On-demand billing means I never think about capacity, and the
 History view reads straight from the table.
 
+### Voice Notes with Amazon Transcribe
+
+Typing and the live microphone (Web Speech API) cover most input, but I also wanted users to
+**upload a recorded voice note**. The browser's speech API can only listen to the live mic — it
+can't transcribe an audio file — so I added a proper server-side path with **Amazon Transcribe**.
+The frontend base64-encodes the file and calls `POST /transcribe`; the Lambda stores it in
+**Amazon S3** and starts an asynchronous Transcribe job. The UI then polls
+`GET /transcribe-status` until the transcript is ready and splits it into task lines. Using an
+async job + polling keeps everything within API Gateway's 30-second window, and an S3 lifecycle
+rule auto-deletes uploads and transcripts after a day to keep costs at zero.
+
+### Review & Confirm Before Ranking
+
+Speech recognition is never perfect — words get misheard and the same task sometimes gets
+captured twice. So after any voice input (mic or upload), the app shows a **review step**:
+*"Here's what I understood."* Each detected task appears in an editable field, duplicates are
+removed automatically, and lines that look unclear (too short or a filler word) are highlighted
+so the user can clarify them. From there you can fix wording, delete tasks, or add missing ones,
+and only when you press **Confirm & Prioritize** does the ranking run. This turns imperfect
+transcription into a quick, trustworthy review rather than a wrong result — a small step that
+makes the voice features genuinely usable.
+
 ### Infrastructure as Code & Deployment
 
 All backend resources are declared in a single **AWS SAM** template and deployed with
@@ -131,21 +157,26 @@ Bedrock directly — no deployment needed while developing.
 | **AWS Lambda** | Runs the Python backend without server management |
 | **Amazon API Gateway (HTTP API)** | Securely exposes the REST endpoints with CORS |
 | **Amazon DynamoDB** | Stores historical prioritization runs (on-demand) |
+| **Amazon Transcribe** | Converts uploaded voice notes to text |
+| **Amazon S3** | Temporary storage for voice notes and transcripts (auto-expiring) |
 | **AWS Amplify Hosting** | Hosts and globally serves the static frontend |
 | **AWS SAM + CloudFormation** | Infrastructure as Code, deployed via the AWS CLI |
-| **AWS IAM** | Least-privilege permissions (scoped `bedrock:InvokeModel` + DynamoDB CRUD) |
+| **AWS IAM** | Least-privilege permissions (scoped Bedrock, DynamoDB, S3 & Transcribe) |
 
 **Architecture**
 
 ```
 Browser · AWS Amplify Hosting (static HTML / CSS / JS)
-   │  POST /prioritize · GET /history   (HTTPS + CORS)
+   │  POST /prioritize · GET /history          (HTTPS + CORS)
+   │  POST /transcribe · GET /transcribe-status
    ▼
 Amazon API Gateway (HTTP API)
    ▼
 AWS Lambda (Python 3.12, arm64)
-   ├─ Amazon Bedrock  → Nova Lite   (ranking + reasoning)
-   └─ Amazon DynamoDB → save & list run history
+   ├─ Amazon Bedrock     → Nova Lite   (ranking + reasoning)
+   ├─ Amazon DynamoDB    → save & list run history
+   ├─ Amazon S3          → store voice notes + transcripts
+   └─ Amazon Transcribe  → voice-note speech-to-text
 ```
 
 Every component sits comfortably within the **AWS Free Tier** for personal use.
@@ -186,6 +217,11 @@ and deploy for the backend, plus Amplify's presigned-URL zip upload for the fron
 iteration to get right, but the payoff is a fully scriptable, reproducible ship process with no
 manual console steps.
 
+Adding **voice-note upload** was another lesson in respecting service limits. My first attempt
+tried to transcribe the file in the browser, which doesn't work — the Web Speech API only listens
+to the live mic. Switching to **Amazon Transcribe** with an asynchronous job plus client-side
+polling solved it cleanly and stayed within API Gateway's 30-second timeout.
+
 ---
 
 ## What I Learned
@@ -197,6 +233,7 @@ patterns. The most valuable lessons:
   defensive parsing is the difference between a demo and something you'd rely on daily.
 - Deploying and iterating on **Amazon Bedrock** with a scoped IAM policy.
 - Wiring **Lambda + API Gateway + DynamoDB** together cleanly with one readable SAM template.
+- Orchestrating **Amazon Transcribe** as an async job with S3 storage and client-side polling.
 - Shipping a **fully CLI-driven pipeline** — CloudFormation for the backend, Amplify's deploy API
   for the frontend — which is fast, scriptable, and reproducible.
 - Applying **least-privilege IAM** and basic web security (HTML-escaping user input to prevent XSS).
@@ -217,7 +254,7 @@ deployed, working, and genuinely useful — beats an ambitious one that never sh
 
 AI Task Prioritizer has a solid foundation, with several enhancements planned:
 
-- Server-side transcription with **Amazon Transcribe** (Safari + offline audio support)
+- Server-side transcription with **Amazon Transcribe** (multi-language support)
 - User accounts and per-user history with **Amazon Cognito**
 - Calendar export (`.ics`) generated from suggested due dates
 - Weekly productivity analytics and trends
@@ -231,8 +268,9 @@ AI Task Prioritizer has a solid foundation, with several enhancements planned:
 Building AI Task Prioritizer for the AWS Weekend Productivity Challenge was a great opportunity to
 explore how generative AI and serverless technologies combine to solve a practical, everyday
 problem. By pairing **Amazon Bedrock** with **AWS Lambda**, **API Gateway**, **DynamoDB**,
-**Amplify Hosting**, and **SAM / CloudFormation**, I shipped a scalable, production-ready app that
-helps people prioritize their work and make smarter decisions about their time.
+**Amazon Transcribe**, **Amazon S3**, **Amplify Hosting**, and **SAM / CloudFormation**, I shipped
+a scalable, production-ready app that helps people prioritize their work and make smarter
+decisions about their time.
 
 This project reinforced how powerful managed AWS services are for rapidly building AI-enabled
 applications — letting builders focus on solving user problems instead of managing infrastructure.

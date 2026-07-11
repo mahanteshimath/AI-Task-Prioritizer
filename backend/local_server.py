@@ -13,6 +13,7 @@ Requires: AWS credentials configured (aws configure) with Bedrock Nova access.
 The production path (Lambda + API Gateway + DynamoDB) lives in template.yaml / src/app.py.
 """
 
+import base64
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 from dotenv import load_dotenv
 
@@ -32,12 +34,18 @@ from botocore.exceptions import ClientError, NoCredentialsError
 MODEL_ID = os.environ.get("MODEL_ID", "amazon.nova-lite-v1:0")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 PORT = int(os.environ.get("PORT", "8000"))
+AUDIO_BUCKET = os.environ.get("AUDIO_BUCKET", "")
 
 FRONTEND_DIR = (Path(__file__).parent.parent / "frontend").resolve()
 HISTORY_FILE = Path(__file__).parent / ".local_history.json"
 MAX_TASKS = 25
 
+ALLOWED_AUDIO_FORMATS = {"mp3", "mp4", "m4a", "wav", "flac", "ogg", "amr", "webm"}
+MAX_AUDIO_BYTES = 5 * 1024 * 1024
+
 _bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+_s3 = boto3.client("s3", region_name=REGION)
+_transcribe = boto3.client("transcribe", region_name=REGION)
 
 SYSTEM_PROMPT = (
     "You are a productivity assistant that prioritizes to-do lists. "
@@ -129,10 +137,36 @@ class Handler(BaseHTTPRequestHandler):
             runs = _load_history()[:5]
             self._send_json(200, {"runs": runs})
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/transcribe-status":
+            self._handle_transcribe_status()
+            return
         self._serve_static()
 
+    def do_DELETE(self):  # noqa: N802
+        if self.path.split("?", 1)[0].rstrip("/") != "/history":
+            self._send_json(404, {"error": "Not found."})
+            return
+        params = parse_qs(urlparse(self.path).query)
+        clear_all = (params.get("all", [""])[0]).lower() == "true"
+        created_at = (params.get("createdAt", [""])[0]).strip()
+        runs = _load_history()
+        if clear_all:
+            HISTORY_FILE.write_text("[]", encoding="utf-8")
+            self._send_json(200, {"deleted": len(runs)})
+            return
+        if not created_at:
+            self._send_json(400, {"error": "Provide 'createdAt' or 'all=true'."})
+            return
+        remaining = [r for r in runs if r.get("createdAt") != created_at]
+        HISTORY_FILE.write_text(json.dumps(remaining, indent=2), encoding="utf-8")
+        self._send_json(200, {"deleted": len(runs) - len(remaining)})
+
     def do_POST(self):  # noqa: N802
-        if self.path.rstrip("/") != "/prioritize":
+        route = self.path.rstrip("/")
+        if route == "/transcribe":
+            self._handle_transcribe()
+            return
+        if route != "/prioritize":
             self._send_json(404, {"error": "Not found."})
             return
 
@@ -179,6 +213,87 @@ class Handler(BaseHTTPRequestHandler):
         }
         _save_run(item)
         self._send_json(200, {"id": item["id"], "createdAt": item["createdAt"], "tasks": ranked})
+
+    def _handle_transcribe(self):
+        if not AUDIO_BUCKET:
+            self._send_json(500, {"error": "Set AUDIO_BUCKET in .env to enable voice-note upload locally."})
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+        try:
+            data = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "Request body must be valid JSON."})
+            return
+
+        audio_b64 = data.get("audio") or ""
+        fmt = str(data.get("format") or "").lower().lstrip(".")
+        if fmt == "mpeg":
+            fmt = "mp3"
+        if fmt not in ALLOWED_AUDIO_FORMATS:
+            self._send_json(400, {"error": f"Unsupported audio format '{fmt}'."})
+            return
+        if "," in audio_b64 and audio_b64.strip().startswith("data:"):
+            audio_b64 = audio_b64.split(",", 1)[1]
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+        except (ValueError, TypeError):
+            self._send_json(400, {"error": "Could not decode audio (invalid base64)."})
+            return
+        if not audio_bytes:
+            self._send_json(400, {"error": "No audio data provided."})
+            return
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            self._send_json(400, {"error": "Audio is too large (max 5 MB)."})
+            return
+
+        job = "tp-" + uuid.uuid4().hex
+        key = f"uploads/{job}.{fmt}"
+        try:
+            _s3.put_object(Bucket=AUDIO_BUCKET, Key=key, Body=audio_bytes)
+            _transcribe.start_transcription_job(
+                TranscriptionJobName=job,
+                LanguageCode="en-US",
+                MediaFormat=fmt,
+                Media={"MediaFileUri": f"s3://{AUDIO_BUCKET}/{key}"},
+                OutputBucketName=AUDIO_BUCKET,
+                OutputKey=f"transcripts/{job}.json",
+            )
+        except (ClientError, NoCredentialsError) as exc:
+            self._send_json(502, {"error": f"Transcribe error: {exc}"})
+            return
+        self._send_json(202, {"jobName": job})
+
+    def _handle_transcribe_status(self):
+        if not AUDIO_BUCKET:
+            self._send_json(500, {"error": "Transcription is not configured."})
+            return
+        params = parse_qs(urlparse(self.path).query)
+        job = (params.get("job", [""])[0]).strip()
+        if not job or not re.fullmatch(r"[0-9a-zA-Z._-]{1,200}", job):
+            self._send_json(400, {"error": "Missing or invalid 'job' parameter."})
+            return
+        try:
+            resp = _transcribe.get_transcription_job(TranscriptionJobName=job)
+        except ClientError as exc:
+            self._send_json(404, {"error": f"Job not found: {exc}"})
+            return
+        status = resp["TranscriptionJob"]["TranscriptionJobStatus"]
+        if status == "FAILED":
+            self._send_json(200, {"status": "FAILED",
+                                  "error": resp["TranscriptionJob"].get("FailureReason", "Failed.")})
+            return
+        if status != "COMPLETED":
+            self._send_json(200, {"status": "IN_PROGRESS"})
+            return
+        try:
+            obj = _s3.get_object(Bucket=AUDIO_BUCKET, Key=f"transcripts/{job}.json")
+            doc = json.loads(obj["Body"].read())
+            text = doc["results"]["transcripts"][0]["transcript"]
+        except (ClientError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            self._send_json(502, {"error": f"Could not read transcript: {exc}"})
+            return
+        self._send_json(200, {"status": "COMPLETED", "text": text})
 
     def _serve_static(self):
         rel = self.path.split("?", 1)[0].lstrip("/")

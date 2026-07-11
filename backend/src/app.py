@@ -7,6 +7,7 @@ Routes:
 Deployed via AWS SAM (see template.yaml).
 """
 
+import base64
 import json
 import os
 import re
@@ -20,13 +21,20 @@ from botocore.exceptions import ClientError
 TABLE_NAME = os.environ["TABLE_NAME"]
 MODEL_ID = os.environ.get("MODEL_ID", "amazon.nova-lite-v1:0")
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")
+AUDIO_BUCKET = os.environ.get("AUDIO_BUCKET", "")
 
 _dynamodb = boto3.resource("dynamodb")
 _table = _dynamodb.Table(TABLE_NAME)
 _bedrock = boto3.client("bedrock-runtime")
+_s3 = boto3.client("s3")
+_transcribe = boto3.client("transcribe")
 
 HISTORY_PK = "history"
 MAX_TASKS = 25
+
+# Audio formats Amazon Transcribe accepts.
+ALLOWED_AUDIO_FORMATS = {"mp3", "mp4", "m4a", "wav", "flac", "ogg", "amr", "webm"}
+MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 5 MB
 
 SYSTEM_PROMPT = (
     "You are a productivity assistant that prioritizes to-do lists. "
@@ -156,6 +164,117 @@ def _handle_history():
     return _response(200, {"runs": runs})
 
 
+def _handle_delete_history(event):
+    """Delete one run (by createdAt) or clear all runs (all=true)."""
+    params = event.get("queryStringParameters") or {}
+    clear_all = str(params.get("all", "")).lower() == "true"
+    created_at = (params.get("createdAt") or "").strip()
+
+    try:
+        if clear_all:
+            deleted = 0
+            resp = _table.query(KeyConditionExpression=Key("pk").eq(HISTORY_PK))
+            items = resp.get("Items", [])
+            while items:
+                with _table.batch_writer() as batch:
+                    for it in items:
+                        batch.delete_item(Key={"pk": HISTORY_PK, "createdAt": it["createdAt"]})
+                        deleted += 1
+                lek = resp.get("LastEvaluatedKey")
+                if not lek:
+                    break
+                resp = _table.query(
+                    KeyConditionExpression=Key("pk").eq(HISTORY_PK),
+                    ExclusiveStartKey=lek,
+                )
+                items = resp.get("Items", [])
+            return _response(200, {"deleted": deleted})
+
+        if not created_at:
+            return _response(400, {"error": "Provide 'createdAt' or 'all=true'."})
+        _table.delete_item(Key={"pk": HISTORY_PK, "createdAt": created_at})
+        return _response(200, {"deleted": 1})
+    except ClientError as exc:
+        return _response(500, {"error": f"Failed to delete: {exc.response['Error']['Message']}"})
+
+
+def _handle_transcribe(event):
+    """Accept a base64 audio clip, store it in S3, and start a Transcribe job."""
+    if not AUDIO_BUCKET:
+        return _response(500, {"error": "Transcription is not configured (no audio bucket)."})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _response(400, {"error": "Request body must be valid JSON."})
+
+    audio_b64 = body.get("audio") or ""
+    fmt = str(body.get("format") or "").lower().lstrip(".")
+    if fmt == "mpeg":
+        fmt = "mp3"
+    if fmt not in ALLOWED_AUDIO_FORMATS:
+        return _response(400, {"error": f"Unsupported audio format '{fmt}'. Allowed: {', '.join(sorted(ALLOWED_AUDIO_FORMATS))}."})
+
+    # The base64 may include a data URL prefix (data:audio/webm;base64,....)
+    if "," in audio_b64 and audio_b64.strip().startswith("data:"):
+        audio_b64 = audio_b64.split(",", 1)[1]
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except (ValueError, TypeError):
+        return _response(400, {"error": "Could not decode audio (invalid base64)."})
+    if not audio_bytes:
+        return _response(400, {"error": "No audio data provided."})
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        return _response(400, {"error": "Audio is too large (max 5 MB). Please upload a shorter clip."})
+
+    job = "tp-" + uuid.uuid4().hex
+    key = f"uploads/{job}.{fmt}"
+    try:
+        _s3.put_object(Bucket=AUDIO_BUCKET, Key=key, Body=audio_bytes)
+        _transcribe.start_transcription_job(
+            TranscriptionJobName=job,
+            LanguageCode="en-US",
+            MediaFormat=fmt,
+            Media={"MediaFileUri": f"s3://{AUDIO_BUCKET}/{key}"},
+            OutputBucketName=AUDIO_BUCKET,
+            OutputKey=f"transcripts/{job}.json",
+        )
+    except ClientError as exc:
+        return _response(502, {"error": f"Transcribe error: {exc.response['Error']['Message']}"})
+
+    return _response(202, {"jobName": job})
+
+
+def _handle_transcribe_status(event):
+    """Return the status (and transcript, when done) of a Transcribe job."""
+    if not AUDIO_BUCKET:
+        return _response(500, {"error": "Transcription is not configured."})
+    params = event.get("queryStringParameters") or {}
+    job = (params.get("job") or "").strip()
+    if not job or not re.fullmatch(r"[0-9a-zA-Z._-]{1,200}", job):
+        return _response(400, {"error": "Missing or invalid 'job' parameter."})
+
+    try:
+        resp = _transcribe.get_transcription_job(TranscriptionJobName=job)
+    except ClientError as exc:
+        return _response(404, {"error": f"Job not found: {exc.response['Error']['Message']}"})
+
+    status = resp["TranscriptionJob"]["TranscriptionJobStatus"]
+    if status == "FAILED":
+        reason = resp["TranscriptionJob"].get("FailureReason", "Transcription failed.")
+        return _response(200, {"status": "FAILED", "error": reason})
+    if status != "COMPLETED":
+        return _response(200, {"status": "IN_PROGRESS"})
+
+    try:
+        obj = _s3.get_object(Bucket=AUDIO_BUCKET, Key=f"transcripts/{job}.json")
+        transcript_doc = json.loads(obj["Body"].read())
+        text = transcript_doc["results"]["transcripts"][0]["transcript"]
+    except (ClientError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        return _response(502, {"error": f"Could not read transcript: {exc}"})
+
+    return _response(200, {"status": "COMPLETED", "text": text})
+
+
 def handler(event, _context):
     method = event.get("requestContext", {}).get("http", {}).get("method", "")
     path = event.get("requestContext", {}).get("http", {}).get("path", "")
@@ -166,4 +285,10 @@ def handler(event, _context):
         return _handle_prioritize(event)
     if method == "GET" and path.endswith("/history"):
         return _handle_history()
+    if method == "DELETE" and path.endswith("/history"):
+        return _handle_delete_history(event)
+    if method == "POST" and path.endswith("/transcribe"):
+        return _handle_transcribe(event)
+    if method == "GET" and path.endswith("/transcribe-status"):
+        return _handle_transcribe_status(event)
     return _response(404, {"error": "Not found."})

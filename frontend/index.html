@@ -63,6 +63,21 @@
         </div>
       </section>
 
+      <!-- Review step: shown after voice/upload so the user can confirm & edit tasks -->
+      <section id="reviewCard" class="card hidden">
+        <div class="review-head">
+          <h2>🎙️ Here's what I understood</h2>
+          <p class="review-sub">Review and edit your tasks below, then confirm. Fix any words that were misheard, remove duplicates, or add anything missing.</p>
+        </div>
+        <ul id="reviewList" class="review-list"></ul>
+        <button id="addTaskBtn" type="button" class="ghost add-task-btn">＋ Add a task</button>
+        <div class="review-actions">
+          <button id="confirmReviewBtn" type="button">✓ Confirm &amp; Prioritize</button>
+          <button id="cancelReviewBtn" type="button" class="ghost">Cancel</button>
+          <span id="reviewStatus" class="status" role="status"></span>
+        </div>
+      </section>
+
       <section id="resultsCard" class="card hidden">
         <div class="results-head">
           <h2 id="resultsTitle">Prioritized list</h2>
@@ -121,7 +136,10 @@
       <section class="card">
         <div class="history-head">
           <h2>Recent runs</h2>
-          <button id="refreshHistory" type="button" class="ghost">Refresh</button>
+          <div class="history-actions">
+            <button id="refreshHistory" type="button" class="ghost">Refresh</button>
+            <button id="clearAllHistory" type="button" class="ghost danger">Clear all</button>
+          </div>
         </div>
         <ul id="history" class="history"></ul>
       </section>

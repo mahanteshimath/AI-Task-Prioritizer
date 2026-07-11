@@ -19,11 +19,18 @@ const els = {
   backToLatest: document.getElementById("backToLatest"),
   history: document.getElementById("history"),
   refreshHistory: document.getElementById("refreshHistory"),
+  clearAllHistory: document.getElementById("clearAllHistory"),
   micBtn: document.getElementById("micBtn"),
   micLabel: document.getElementById("micLabel"),
   voiceStatus: document.getElementById("voiceStatus"),
   audioUpload: document.getElementById("audioUpload"),
   clearBtn: document.getElementById("clearBtn"),
+  reviewCard: document.getElementById("reviewCard"),
+  reviewList: document.getElementById("reviewList"),
+  addTaskBtn: document.getElementById("addTaskBtn"),
+  confirmReviewBtn: document.getElementById("confirmReviewBtn"),
+  cancelReviewBtn: document.getElementById("cancelReviewBtn"),
+  reviewStatus: document.getElementById("reviewStatus"),
   totalTasks: document.getElementById("totalTasks"),
   totalTime: document.getElementById("totalTime"),
   quickWinCount: document.getElementById("quickWinCount"),
@@ -194,7 +201,10 @@ async function loadHistory() {
       li.innerHTML = `
         <div class="tile-head">
           <span class="meta">${escapeHtml(when)}</span>
-          <span class="tile-view">View →</span>
+          <div class="tile-head-right">
+            <span class="tile-view">View →</span>
+            <button type="button" class="tile-delete" title="Delete this run" aria-label="Delete this run">🗑</button>
+          </div>
         </div>
         <div class="tile-preview">${top || "—"}</div>
         <div class="tile-chips">
@@ -209,6 +219,12 @@ async function loadHistory() {
       li.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
       });
+      const delBtn = li.querySelector(".tile-delete");
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteRun(run, li);
+      });
+      delBtn.addEventListener("keydown", (e) => e.stopPropagation());
       els.history.appendChild(li);
     });
     if (!runs.length) {
@@ -234,11 +250,172 @@ function viewPastRun(run, tileEl) {
   els.resultsCard.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// Delete a single past run.
+async function deleteRun(run, tileEl) {
+  if (!apiBase && location.protocol === "file:") return;
+  if (!confirm("Delete this run? This can't be undone.")) return;
+  try {
+    tileEl.classList.add("deleting");
+    const res = await fetch(`${apiBase}/history?createdAt=${encodeURIComponent(run.createdAt)}`, {
+      method: "DELETE",
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Delete failed");
+    // If we were viewing this run, close the results panel.
+    if (tileEl.classList.contains("active")) {
+      els.resultsCard.classList.add("hidden");
+      els.viewingBanner.classList.add("hidden");
+    }
+    loadHistory();
+  } catch (err) {
+    tileEl.classList.remove("deleting");
+    alert("Could not delete run: " + err.message);
+  }
+}
+
+// Delete all past runs.
+async function clearAllRuns() {
+  if (!apiBase && location.protocol === "file:") return;
+  if (!confirm("Delete ALL past runs? This can't be undone.")) return;
+  try {
+    const res = await fetch(`${apiBase}/history?all=true`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Clear failed");
+    els.resultsCard.classList.add("hidden");
+    els.viewingBanner.classList.add("hidden");
+    loadHistory();
+  } catch (err) {
+    alert("Could not clear history: " + err.message);
+  }
+}
+
 els.prioritize.addEventListener("click", prioritize);
 
 // ============================================================================
-// VOICE INPUT — Web Speech API (live mic) + file upload transcription
+// REVIEW STEP — confirm & edit voice/recorded tasks before prioritizing
 // ============================================================================
+
+function setReviewStatus(msg, isError = false) {
+  els.reviewStatus.textContent = msg;
+  els.reviewStatus.classList.toggle("error", isError);
+}
+
+// Turn raw text (typed or transcribed) into clean, de-duplicated task lines.
+function parseTasksFromText(text) {
+  const parts = String(text || "")
+    .split(/[\n.;]+|,\s+(?:and|then)\s+/i)
+    .map((s) => s.trim().replace(/\s+/g, " "))
+    .filter(Boolean);
+  const seen = new Set();
+  const unique = [];
+  for (const p of parts) {
+    const key = p.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(p);
+    }
+  }
+  return unique;
+}
+
+// A line is "unclear" if it's very short or a single filler word.
+function isUnclear(text) {
+  const t = text.trim().toLowerCase();
+  if (t.length < 3) return true;
+  const fillers = new Set(["um", "uh", "the", "and", "then", "a", "an", "to", "i", "it"]);
+  const words = t.split(/\s+/);
+  return words.length === 1 && fillers.has(words[0]);
+}
+
+function makeReviewRow(value) {
+  const li = document.createElement("li");
+  li.className = "review-row";
+  const unclear = isUnclear(value);
+  li.innerHTML = `
+    <span class="review-drag">⋮⋮</span>
+    <input type="text" class="review-input${unclear ? " unclear" : ""}"
+           value="${escapeHtml(value)}"
+           placeholder="${unclear ? "Unclear — please clarify this task" : "Task description"}"
+           aria-label="Task" />
+    <button type="button" class="review-remove" title="Remove this task" aria-label="Remove">✕</button>
+  `;
+  li.querySelector(".review-remove").addEventListener("click", () => {
+    li.remove();
+    updateReviewState();
+  });
+  const input = li.querySelector(".review-input");
+  input.addEventListener("input", () => {
+    input.classList.toggle("unclear", isUnclear(input.value));
+    updateReviewState();
+  });
+  return li;
+}
+
+function collectReviewTasks() {
+  return [...els.reviewList.querySelectorAll(".review-input")]
+    .map((i) => i.value.trim())
+    .filter(Boolean);
+}
+
+function updateReviewState() {
+  const tasks = collectReviewTasks();
+  const unclearCount = [...els.reviewList.querySelectorAll(".review-input")]
+    .filter((i) => i.value.trim() && isUnclear(i.value)).length;
+  els.confirmReviewBtn.disabled = tasks.length === 0;
+  if (!tasks.length) {
+    setReviewStatus("Add at least one task to continue.", true);
+  } else if (unclearCount) {
+    setReviewStatus(`${unclearCount} task${unclearCount === 1 ? "" : "s"} may be unclear — please review the highlighted rows.`, true);
+  } else {
+    setReviewStatus(`${tasks.length} task${tasks.length === 1 ? "" : "s"} ready.`);
+  }
+}
+
+// Show the review panel for a set of tasks (from voice/upload).
+function showReviewStep(tasks, sourceLabel) {
+  els.reviewList.innerHTML = "";
+  const cleaned = tasks.length ? tasks : [""];
+  cleaned.forEach((t) => els.reviewList.appendChild(makeReviewRow(t)));
+  els.reviewCard.classList.remove("hidden");
+  updateReviewState();
+  els.reviewCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  const first = els.reviewList.querySelector(".review-input");
+  if (first) first.focus();
+  if (sourceLabel) setReviewStatus(`${cleaned.length} task${cleaned.length === 1 ? "" : "s"} detected from ${sourceLabel}. Review below.`);
+}
+
+function hideReviewStep() {
+  els.reviewCard.classList.add("hidden");
+  els.reviewList.innerHTML = "";
+}
+
+els.addTaskBtn.addEventListener("click", () => {
+  els.reviewList.appendChild(makeReviewRow(""));
+  updateReviewState();
+  const inputs = els.reviewList.querySelectorAll(".review-input");
+  inputs[inputs.length - 1]?.focus();
+});
+
+els.cancelReviewBtn.addEventListener("click", () => {
+  // Keep whatever was captured in the textarea so the user can edit manually.
+  const tasks = collectReviewTasks();
+  els.tasks.value = tasks.join("\n");
+  hideReviewStep();
+  setVoiceStatus("Tasks moved to the editor — edit and press Prioritize when ready.");
+  els.tasks.focus();
+});
+
+els.confirmReviewBtn.addEventListener("click", () => {
+  const tasks = collectReviewTasks();
+  if (!tasks.length) {
+    updateReviewState();
+    return;
+  }
+  els.tasks.value = tasks.join("\n");
+  hideReviewStep();
+  prioritize();
+});
+
 
 function setVoiceStatus(msg, isError = false) {
   els.voiceStatus.textContent = msg;
@@ -330,9 +507,14 @@ function stopListening() {
   }
   els.micBtn.classList.remove("recording");
   els.micLabel.textContent = "Speak";
-  const lines = els.tasks.value.trim().split("\n").filter(Boolean).length;
-  if (lines) setVoiceStatus(`Captured ${lines} task${lines === 1 ? "" : "s"} from voice.`);
-  else setVoiceStatus("");
+  const captured = els.tasks.value.trim();
+  const tasks = parseTasksFromText(captured);
+  if (tasks.length) {
+    setVoiceStatus(`Captured ${tasks.length} task${tasks.length === 1 ? "" : "s"} — review before prioritizing.`);
+    showReviewStep(tasks, "your recording");
+  } else {
+    setVoiceStatus("");
+  }
 }
 
 els.micBtn.addEventListener("click", () => {
@@ -340,75 +522,106 @@ els.micBtn.addEventListener("click", () => {
   else startListening();
 });
 
-// --- Voice note file upload (uses browser MediaRecorder decode + Speech Recognition) ---
-// For uploaded audio files, we use the AudioContext to play them through a
-// MediaStreamDestination and feed that into SpeechRecognition. This is a
-// browser-only approach that avoids needing Amazon Transcribe.
+// --- Voice note file upload (Amazon Transcribe) ---
+// Uploaded audio can't be transcribed by the browser's Web Speech API (that only
+// listens to the live mic). Instead we send the file to the backend, which stores
+// it in S3 and runs an Amazon Transcribe job, then we poll for the result.
+
+const AUDIO_EXT_MAP = {
+  "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+  "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/flac": "flac",
+  "audio/x-flac": "flac", "audio/mp4": "mp4", "audio/x-m4a": "m4a", "audio/m4a": "m4a",
+  "audio/amr": "amr", "audio/aac": "mp4",
+};
+const ALLOWED_AUDIO_EXT = ["mp3", "mp4", "m4a", "wav", "flac", "ogg", "amr", "webm"];
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+    reader.onerror = () => reject(new Error("Could not read the file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function guessAudioFormat(file) {
+  const byMime = AUDIO_EXT_MAP[(file.type || "").toLowerCase()];
+  if (byMime) return byMime;
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  return ALLOWED_AUDIO_EXT.includes(ext) ? ext : "";
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 els.audioUpload.addEventListener("change", async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
   els.audioUpload.value = ""; // reset for re-upload
 
-  if (!SpeechRecognition) {
-    setVoiceStatus("Speech recognition not supported in this browser.", true);
+  if (!apiBase && location.protocol === "file:") {
+    setVoiceStatus("Open the app via the server to use voice-note upload.", true);
     return;
   }
 
-  setVoiceStatus(`Processing "${file.name}"…`);
+  const format = guessAudioFormat(file);
+  if (!format) {
+    setVoiceStatus("Unsupported audio type. Use mp3, mp4/m4a, wav, flac, ogg, amr, or webm.", true);
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    setVoiceStatus("Audio is too large (max 5 MB). Please upload a shorter clip.", true);
+    return;
+  }
 
   try {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const arrayBuf = await file.arrayBuffer();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+    setVoiceStatus(`Uploading "${file.name}"…`);
+    const audio = await fileToBase64(file);
 
-    // Create a MediaStreamDestination so we can feed audio into SpeechRecognition
-    const dest = audioCtx.createMediaStreamDestination();
-    const source = audioCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(dest);
-    source.connect(audioCtx.destination); // optional: hear it play
+    const startRes = await fetch(`${apiBase}/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio, format }),
+    });
+    const startData = await startRes.json();
+    if (!startRes.ok) throw new Error(startData.error || `Upload failed (${startRes.status})`);
+    const jobName = startData.jobName;
 
-    const rec = new SpeechRecognition();
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.lang = "en-US";
+    setVoiceStatus("🎧 Transcribing your voice note… this can take up to a minute.");
 
-    // Some browsers support mediaStream on recognition
-    // Fallback: we just let it use the default mic while audio plays through speakers
-    // The most reliable cross-browser approach
-    let transcript = els.tasks.value.trim();
-    if (transcript) transcript += "\n";
+    // Poll for the transcript (up to ~90s)
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await sleep(3000);
+      const statusRes = await fetch(`${apiBase}/transcribe-status?job=${encodeURIComponent(jobName)}`);
+      const statusData = await statusRes.json();
+      if (!statusRes.ok) throw new Error(statusData.error || "Status check failed.");
 
-    rec.onresult = (ev) => {
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        if (ev.results[i].isFinal) {
-          transcript += ev.results[i][0].transcript.trim() + "\n";
-          els.tasks.value = transcript.trim();
+      if (statusData.status === "COMPLETED") {
+        const text = (statusData.text || "").trim();
+        if (!text) {
+          setVoiceStatus("No speech detected in the audio.", true);
+          return;
         }
+        // Merge with anything already in the editor, then open the review step
+        // so the user can confirm/edit before prioritizing.
+        const existing = els.tasks.value.trim();
+        const combined = (existing ? existing + "\n" : "") + text;
+        const tasks = parseTasksFromText(combined);
+        setVoiceStatus(`Transcribed "${file.name}" — review the tasks before prioritizing.`);
+        showReviewStep(tasks, "your voice note");
+        return;
       }
-    };
-
-    rec.onerror = (ev) => {
-      if (ev.error !== "no-speech") setVoiceStatus("Transcription error: " + ev.error, true);
-    };
-
-    source.onended = () => {
-      setTimeout(() => {
-        try { rec.stop(); } catch (_) {}
-        audioCtx.close();
-        const lines = els.tasks.value.trim().split("\n").filter(Boolean).length;
-        setVoiceStatus(`Done — ${lines} task${lines === 1 ? "" : "s"} from voice note.`);
-      }, 1500); // give recognition a moment to finish
-    };
-
-    rec.start();
-    source.start(0);
+      if (statusData.status === "FAILED") {
+        throw new Error(statusData.error || "Transcription failed.");
+      }
+    }
+    setVoiceStatus("Transcription is taking longer than expected. Please try a shorter clip.", true);
   } catch (err) {
-    setVoiceStatus("Could not process audio: " + err.message, true);
+    setVoiceStatus("Voice note failed: " + err.message, true);
   }
 });
 els.refreshHistory.addEventListener("click", loadHistory);
+els.clearAllHistory.addEventListener("click", clearAllRuns);
 
 // --- Close "viewing past run" banner: hide the results panel ---
 els.backToLatest.addEventListener("click", () => {
@@ -422,6 +635,7 @@ els.clearBtn.addEventListener("click", () => {
   els.tasks.value = "";
   els.resultsCard.classList.add("hidden");
   els.viewingBanner.classList.add("hidden");
+  hideReviewStep();
   document.querySelectorAll(".history-tile.active").forEach((el) => el.classList.remove("active"));
   setStatus("");
   setVoiceStatus("");

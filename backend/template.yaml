@@ -38,6 +38,20 @@ Resources:
         - AttributeName: createdAt
           KeyType: RANGE
 
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAudioAndTranscripts
+            Status: Enabled
+            ExpirationInDays: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
   PrioritizerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -48,15 +62,23 @@ Resources:
           TABLE_NAME: !Ref TasksTable
           MODEL_ID: !Ref ModelId
           CORS_ORIGIN: !Ref CorsOrigin
+          AUDIO_BUCKET: !Ref AudioBucket
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref TasksTable
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
         - Statement:
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
               Resource:
                 - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+              Resource: "*"
       Events:
         Prioritize:
           Type: HttpApi
@@ -70,6 +92,24 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /history
             Method: GET
+        DeleteHistory:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /history
+            Method: DELETE
+        Transcribe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /transcribe
+            Method: POST
+        TranscribeStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /transcribe-status
+            Method: GET
 
   HttpApi:
     Type: AWS::Serverless::HttpApi
@@ -82,6 +122,7 @@ Resources:
         AllowMethods:
           - GET
           - POST
+          - DELETE
           - OPTIONS
 
 Outputs:
@@ -91,3 +132,6 @@ Outputs:
   TableName:
     Description: DynamoDB table storing prioritization history.
     Value: !Ref TasksTable
+  AudioBucketName:
+    Description: S3 bucket used for voice-note uploads and transcripts.
+    Value: !Ref AudioBucket
